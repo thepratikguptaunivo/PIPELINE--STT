@@ -436,6 +436,7 @@ def smart_vad_chunker(
 ## Phase 3: GPU-Side Feature Extraction, Neural Inference & Post-Processing (VRAM)
 
 Once Module 1C produces clean, $\le 28\text{s}$ standardized $16\text{ kHz}$ chunks, they are passed to the GPU (VRAM) for neural transcription and enrichment.
+our smart VAD chunker outputs a clean $16\text{ kHz}$ 1D audio tensor of up to $28.0\text{ seconds}$ (padded to $30.0\text{ seconds}$ = $480,000\text{ float32 samples}$ for Whisper)
 
 ### 1. Log-Mel Spectrogram Generation (4 Mathematical Steps)
 
@@ -477,24 +478,44 @@ At this point, the pipeline has raw transcribed text per chunk, plus any overlap
 * **If Mono / Identical Stereo:** Simultaneously or immediately following alignment, the pipeline runs **`pyannote.audio`** on the GPU to extract speaker voiceprint embeddings, cluster them, and assign `SPEAKER_00` (Counselor) and `SPEAKER_01` (Student) labels to every word timestamp.
 
 ---
+## Phase 4: Audio Feature Extraction, Acoustic Embeddings & Hinglish BPE Tokenization
+* Smart VAD chunker outputs a clean $16\text{ kHz}$ 1D audio tensor of up to $28.0\text{ seconds}$ (padded to $30.0\text{ seconds}$ = $480,000\text{ float32 samples}$ for Whisper).
 
-## Summary of Exact Changes & Fixes Made
+* In a 1D waveform x[n], every single number is the sum of all frequencies happening at that exact microsecond. To make speech recognizable to a neural network, we must decompose the 1D wave into its underlying frequencies over time using the Short-Time Fourier Transform (STFT).
 
-1. **Fixed End-to-End Chronological Ordering:**
-* In your raw notes, the GPU Spectrogram/Transformer section was placed *before* Smart VAD Chunking, and the "Inside Model" CPU preprocessing diagram and code were at the very bottom.
-* Re-arranged everything into the true execution order: **Phase 1 (CPU Ingestion & Standardization)** $\rightarrow$ **Phase 2 (CPU Smart VAD Chunking & Dead Air Audit)** $\rightarrow$ **Phase 3 (GPU Spectrogram, CNN Stem, Transformer, Forced Alignment & Diarization)**.
+[1D Wave: 480k pts] ──(STFT + Mel)──► [2D Heatmap: 128×3000] ──(CNN Stride 2)──► [Encoder: 1500 Audio Vecs] ──(Cross-Attention)──► [Decoder: BPE Text Tokens]
+   (Air pressure)                      (10ms pitch columns)                       (20ms context vectors)                            (Roman Hinglish Subwords)
 
-
-2. **Implemented True Dual-Channel Stereo vs. Identical Stereo Detection in `preprocess_production_audio`:**
-* Previously, your notes stated to split Dual-Channel audio (Agent vs. Customer) and process them independently, while your code blindly averaged all multi-channel files into mono (`torch.mean(waveform, dim=0)`).
-* Updated Step 3 in `preprocess_production_audio` to inspect `torch.max(torch.abs(waveform[0] - waveform[1]))`. If the two tracks carry independent audio (`> 1e-3`), it preserves both channels, runs Kaiser resampling, DC offset removal, $80\text{ Hz}$ high-pass filtering, and $-1.0\text{ dBFS}$ peak normalization in parallel on both tracks, and returns `"channel_0_agent"` and `"channel_1_customer"` separately. If it is identical dual-mono stereo, it downmixes to `"mono_mixed"`.
-
-
-3. **Fixed the Tier 2 Step A $\rightarrow$ Step B Gate Logic in `smart_vad_chunker`:**
-* Previously, when scanning $[22\text{s}, 29\text{s}]$ for the minimum RMS energy (`min_rms`), there was no threshold gate—meaning `min_rms < float('inf')` always succeeded even if the speaker was shouting continuously, preventing Step B ($4\text{s}$ overlapping stride) from ever triggering!
-* Added `micro_breath_rms_ceiling = 0.01` ($-40\text{ dBFS}$). Now, if Step A finds a true quiet micro-breath ($\le -40\text{ dBFS}$) in the $22\text{s}–29\text{s}$ window, it cuts cleanly there (`overlapped=False`). If the speaker never took a quiet breath (`min_rms > 0.01`), it automatically triggers **Step B**, slicing at $28.0\text{s}$, backing up the next window by $4.0\text{s}$ (`24.0s`), and recording `"stitch_midpoint_sec": 26.0` for downstream LCS stitching.
-
-
-4. **Added Midpoint Silence Cutting & Trailing Dead-Air Auditing in `smart_vad_chunker`:**
-* Updated Tier 1 macro-chunk flushing so the cut is placed at the exact mathematical midpoint of the verified silence valley (`(current_end + seg_start) / 2.0`), matching your Tier 1 diagram (`CUT HERE at 26.8s`).
-* Added a post-loop `_audit_gap(prev_end, total_duration_sec)` check so that Dead Air occurring after the final spoken word until the end of the call is also captured.
+   [GATE 0: Input from Smart VAD Chunker]
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 1D Audio Array: 480,000 float numbers (30 seconds × 16,000 Hz)       │
+  │ Looks like: [0.02, -0.15, 0.44, 0.81, -0.09, ... 480,000 numbers]    │
+  └──────────────────────────────────┬───────────────────────────────────┘
+                                     │
+                                     ▼  (Step 1: Slice with a sliding 25ms window every 10ms)
+  [GATE 1: 3,000 Overlapping Audio Slices]
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 3,000 vertical columns (1 column every 10ms).                        │
+  │ Each column holds 400 raw wave numbers (25ms of sound).              │
+  └──────────────────────────────────┬───────────────────────────────────┘
+                                     │
+                                     ▼  (Step 2: FFT + 128 Mel Ear Filters + Log Volume)
+  [GATE 2: The 2D Log-Mel Spectrogram (A 2D Heatmap Image!)]
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Shape: [128 Pitch Rows × 3,000 Time Columns]                         │
+  │ The 1D wave is now a 2D picture! X-axis = Time, Y-axis = Bass/Treble │
+  └──────────────────────────────────┬───────────────────────────────────┘
+                                     │
+                                     ▼  (Step 3: 2-Layer CNN Stem — Stride=2 merges pairs)
+  [GATE 3: 1,500 Acoustic Vectors (Entering the Transformer Encoder)]
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Shape: [1,280 Deep Features × 1,500 Time Columns]                    │
+  │ 3,000 columns got zipped in half into 1,500 columns (1 every 20ms).  │
+  └──────────────────────────────────┬───────────────────────────────────┘
+                                     │
+                                     ▼  (Step 4: Encoder-Decoder Cross-Attention Spotlight)
+  [GATE 4: Discrete BPE Token IDs ──► Final Hinglish Text]
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Token IDs: [50258, 4821, 11, 29410, 882, 14201, ...]                 │
+  │ Text:      "Sir, Amity MBA ki fees kya hai?"                         │
+  └──────────────────────────────────────────────────────────────────────┘
